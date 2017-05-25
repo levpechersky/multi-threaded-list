@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <assert.h>
+#include <pthread.h>
 #include "my_list.h"
 
 /*------------------------- Types and definitions-----------------------------*/
@@ -15,12 +16,19 @@ typedef struct node_t {
 	int key;
 	void* data;
 	struct node_t* next;
+
 } node;
 
 struct linked_list_t {
 	node* head;
 	int size;
+	pthread_mutex_t lock; // locks entire list
 };
+
+typedef struct list_params_t {
+	linked_list_t* list;
+	op_t* op_param;
+} list_params_t;
 
 enum list_error {
 	SUCCESS = 0,
@@ -30,17 +38,21 @@ enum list_error {
 	NOT_FOUND
 };
 
-#define NULL_INIT_PTR_ARRAY(array, array_size) do {\
-	for(int i=0; i<(array_size); i++){\
-		(array)[i] = NULL;\
-	}}while(0)
-
-#define MALLOC_N_ORELSE(identifier, N, return_error) \
-	identifier = malloc(sizeof(*identifier)*(N)); \
-	if(!identifier) return (return_error);
+#define MALLOC_N_ORELSE(identifier, N, return_error) do {\
+	identifier = malloc(sizeof(*(identifier))*(N)); \
+	if(!(identifier)) return (return_error); \
+	} while(0)
 
 #define MALLOC_ORELSE(identifier, return_error) \
 		MALLOC_N_ORELSE(identifier, 1, return_error)
+
+#define MALLOC_N_OR_RETURN(identifier, N) do {\
+	identifier = malloc(sizeof(*(identifier))*(N)); \
+	if(!(identifier)) return; \
+	} while(0)
+
+#define MALLOC_OR_RETURN(identifier) \
+		MALLOC_N_OR_RETURN(identifier, 1)
 
 /*------------------------- Static helper functions --------------------------*/
 
@@ -103,6 +115,45 @@ static inline node* find(linked_list_t* list, int key) {
 		return NULL;
 }
 
+static inline void list_init(linked_list_t* list) {
+	assert(list);
+	list->head = NULL;
+	list->size = 0;
+}
+
+/*----------------------------Threaded functions wrapper----------------------*/
+
+static void* run_op(void* list_and_params) {
+	assert(list_and_params);
+
+	list_params_t* params = (list_params_t*) list_and_params;
+
+	assert(params->list && params->op_param);
+
+	op_t* op = params->op_param;
+	linked_list_t* list = params->list;
+
+	switch (op->op) {
+	case INSERT:
+		op->result = list_insert(list, op->key, op->data);
+		break;
+	case REMOVE:
+		op->result = list_remove(list, op->key);
+		break;
+	case CONTAINS:
+		op->result = list_find(list, op->key);
+		break;
+	case UPDATE:
+		op->result = list_update(list, op->key, op->data);
+		break;
+	case COMPUTE:
+		op->result = list_compute(list, op->key, op->compute_func, op->data);
+		break;
+	default:
+		assert(0);
+	}
+	return NULL; //since we have to return something
+}
 
 /**---------------------------- Interface functions --------------------------*/
 
@@ -110,11 +161,11 @@ linked_list_t* list_alloc() {
 	linked_list_t* new_list;
 	MALLOC_ORELSE(new_list, NULL);
 
-	new_list->head = NULL;
-	new_list->size = 0;
+	list_init(new_list);
 	return new_list;
 }
 
+//lock all at start
 void list_free(linked_list_t* list) {
 	if (!list)
 		return;
@@ -126,9 +177,9 @@ void list_free(linked_list_t* list) {
 		current = next;
 	}
 	free(list);
-
 }
 
+//lock all at start
 int list_split(linked_list_t* list, int n, linked_list_t** arr) {
 	if (!list || !arr)
 		return NULL_ARG;
@@ -137,6 +188,9 @@ int list_split(linked_list_t* list, int n, linked_list_t** arr) {
 
 	linked_list_t* lists;
 	MALLOC_N_ORELSE(lists, n, MEM_ERROR);
+	for (int i = 0; i < n; i++) {
+		list_init(&lists[i]);
+	}
 
 	node* current = list->head;
 	int i = 0;
@@ -150,6 +204,7 @@ int list_split(linked_list_t* list, int n, linked_list_t** arr) {
 	return SUCCESS;
 }
 
+//TODO don't insert if already exists
 int list_insert(linked_list_t* list, int key, void* data) {
 	if (!list)
 		return NULL_ARG;
@@ -225,8 +280,21 @@ int list_compute(linked_list_t* list, int key,
 }
 
 void list_batch(linked_list_t* list, int num_ops, op_t* ops) {
-	if (!list)
+	if (!list || !ops || num_ops <= 0)
 		return;
-	//TODO
+	pthread_t* threads;
+	MALLOC_N_OR_RETURN(threads, num_ops);
+
+	list_params_t* params;
+	MALLOC_N_OR_RETURN(params, num_ops); //TODO two malloc-s problem?
+
+	for (int i = 0; i < num_ops; i++) {
+		params[i].list = list;
+		params[i].op_param = &ops[i];
+		pthread_create(&threads[i], NULL, run_op, &params[i]); //TODO can fail
+	}
+	for (int i = 0; i < num_ops; i++) {
+		pthread_join(threads[i], NULL);
+	}
 }
 
