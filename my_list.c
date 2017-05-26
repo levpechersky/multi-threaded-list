@@ -8,6 +8,10 @@
 #include <limits.h>
 #include <assert.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include "rwlock.h" // FIXME, must copy-paste it here for an assignment
+
 #include "my_list.h"
 
 /*------------------------- Types and definitions-----------------------------*/
@@ -16,13 +20,13 @@ typedef struct node_t {
 	int key;
 	void* data;
 	struct node_t* next;
-
+	rwlock_t lock;
 } node;
 
 struct linked_list_t {
 	node* head;
 	int size;
-	pthread_mutex_t lock; // locks entire list
+	rwlock_t lock;
 };
 
 typedef struct list_params_t {
@@ -35,24 +39,18 @@ enum list_error {
 	NULL_ARG,
 	INVALID_ARG,
 	MEM_ERROR,
-	NOT_FOUND
+	NOT_FOUND,
+	ALREADY_IN_LIST
 };
 
-#define MALLOC_N_ORELSE(identifier, N, return_error) do {\
+#define MALLOC_N_ORELSE(identifier, N, command) do {\
 	identifier = malloc(sizeof(*(identifier))*(N)); \
-	if(!(identifier)) return (return_error); \
-	} while(0)
+	if(!(identifier)) { \
+	command; \
+	} } while(0)
 
-#define MALLOC_ORELSE(identifier, return_error) \
-		MALLOC_N_ORELSE(identifier, 1, return_error)
-
-#define MALLOC_N_OR_RETURN(identifier, N) do {\
-	identifier = malloc(sizeof(*(identifier))*(N)); \
-	if(!(identifier)) return; \
-	} while(0)
-
-#define MALLOC_OR_RETURN(identifier) \
-		MALLOC_N_OR_RETURN(identifier, 1)
+#define MALLOC_ORELSE(identifier, command) \
+		MALLOC_N_ORELSE(identifier, 1, command)
 
 /*------------------------- Static helper functions --------------------------*/
 
@@ -61,6 +59,7 @@ static inline void init_node(node* new_node, int key, void* data) {
 	new_node->key = key;
 	new_node->data = data;
 	new_node->next = NULL;
+	rw_lock_init(&new_node->lock);
 }
 
 static inline void insert_first(linked_list_t* list, node* new_node) {
@@ -119,10 +118,11 @@ static inline void list_init(linked_list_t* list) {
 	assert(list);
 	list->head = NULL;
 	list->size = 0;
+	rw_lock_init(&list->lock);
 }
 
 /*----------------------------Threaded functions wrapper----------------------*/
-
+//nothing seems to be critical here
 static void* run_op(void* list_and_params) {
 	assert(list_and_params);
 
@@ -159,66 +159,70 @@ static void* run_op(void* list_and_params) {
 
 linked_list_t* list_alloc() {
 	linked_list_t* new_list;
-	MALLOC_ORELSE(new_list, NULL);
+	MALLOC_ORELSE(new_list, return NULL);
 
 	list_init(new_list);
 	return new_list;
 }
 
-//lock all at start
 void list_free(linked_list_t* list) {
 	if (!list)
 		return;
 
+	//lock all?
 	node *current = list->head, *next = NULL;
 	while (current) {
 		next = current->next;
+		rw_lock_destroy(&current->lock);
 		free(current);
 		current = next;
 	}
+	rw_lock_destroy(&list->lock);
 	free(list);
 }
 
-//lock all at start
 int list_split(linked_list_t* list, int n, linked_list_t** arr) {
 	if (!list || !arr)
 		return NULL_ARG;
 	if (n <= 0)
 		return INVALID_ARG;
 
-	linked_list_t* lists;
-	MALLOC_N_ORELSE(lists, n, MEM_ERROR);
 	for (int i = 0; i < n; i++) {
-		list_init(&lists[i]);
+		arr[i] = list_alloc(); // TODO check
+		list_init(arr[i]);
 	}
 
+	//lock all?
 	node* current = list->head;
 	int i = 0;
 	while (current) {
-		list_insert(&lists[i], current->key, current->data);
+		list_insert(arr[i], current->key, current->data);
 		i = (i + 1) % n;
 		current = current->next;
 	}
 	list_free(list);
-	*arr = lists;
 	return SUCCESS;
 }
 
-//TODO don't insert if already exists
 int list_insert(linked_list_t* list, int key, void* data) {
 	if (!list)
 		return NULL_ARG;
 	node* new_node;
-	MALLOC_ORELSE(new_node, MEM_ERROR);
+	MALLOC_ORELSE(new_node, return MEM_ERROR);
 	init_node(new_node, key, data);
 
 	node* prev = closest_below_key(list, key);
-	if (!prev)
+	if (!prev){
+		if(list->head && list->head->key == key)
+			return ALREADY_IN_LIST;
 		insert_first(list, new_node);
-	else
+	}
+	else{
+		if(prev->next && prev->next->key == key)
+			return ALREADY_IN_LIST;
 		insert_after(prev, new_node);
+	}
 	list->size++;
-
 	return SUCCESS;
 }
 
@@ -258,11 +262,11 @@ int list_update(linked_list_t* list, int key, void* data) {
 		return NULL_ARG;
 
 	node* to_update = find(list, key);
-
 	if (!to_update)
 		return NOT_FOUND;
 
 	to_update->data = data;
+
 	return SUCCESS;
 }
 
@@ -283,18 +287,23 @@ void list_batch(linked_list_t* list, int num_ops, op_t* ops) {
 	if (!list || !ops || num_ops <= 0)
 		return;
 	pthread_t* threads;
-	MALLOC_N_OR_RETURN(threads, num_ops);
-
 	list_params_t* params;
-	MALLOC_N_OR_RETURN(params, num_ops); //TODO two malloc-s problem?
+	MALLOC_N_ORELSE(threads, num_ops, return);
+	MALLOC_N_ORELSE(params, num_ops, free(threads); return);
 
 	for (int i = 0; i < num_ops; i++) {
 		params[i].list = list;
 		params[i].op_param = &ops[i];
-		pthread_create(&threads[i], NULL, run_op, &params[i]); //TODO can fail
+		pthread_create(&threads[i], NULL, run_op, &params[i]); //TODO do something in case of failure
 	}
 	for (int i = 0; i < num_ops; i++) {
+#ifdef NDEBUG
 		pthread_join(threads[i], NULL);
+#else
+		assert(pthread_join(threads[i], NULL) == 0);
+#endif
 	}
+	free(params);
+	free(threads);
 }
 

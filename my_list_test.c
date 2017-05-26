@@ -8,7 +8,11 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <time.h>// random
 #include "my_list.h"
+
+#undef RAND_MAX
+#define RAND_MAX 20000
 
 #define ASSERT_TEST(b) do { \
         if (!(b)) { \
@@ -223,18 +227,23 @@ static bool update() {
 }
 
 static bool split() {
-	int keys_n = 10;
+	int keys_n = 10, split_into = 3;
 	int keys[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-	linked_list_t* results;
+	linked_list_t* results[split_into];
 	linked_list_t* list = list_alloc();
 	for (int i = 0; i < keys_n; i++) {
 		list_insert(list, keys[i], &keys[i]);
 	}
 
-	list_split(list, 3, &results);
+	list_split(list, split_into, results);
+	ASSERT_TEST(list_size(results[0]) == 4);
+	ASSERT_TEST(list_size(results[1]) == 3);
+	ASSERT_TEST(list_size(results[2]) == 3);
 
-	//TODO how do I test it? I checked in debugger - it works
-	list_free(list);
+	//list_free(list); Don't need to
+	for(int i=0; i<split_into; i++){
+		list_free(results[i]);
+	}
 	return true;
 }
 
@@ -263,6 +272,79 @@ static bool batch_compute() {
 	return true;
 }
 
+static bool batch_inserts_few() {
+	int keys_n = 6;
+	int keys[] = { -1357, 9342, -26332, -22934, 16824, -14310 };
+	int result;
+	linked_list_t* list = list_alloc();
+	op_t params[keys_n];
+
+	for (int i = 0; i < keys_n; i++) {
+		params[i].compute_func = NULL;
+		params[i].data = &result;
+		params[i].key = keys[i];
+		params[i].op = INSERT;
+		params[i].result = -1;
+	}
+
+	list_batch(list, keys_n, params);
+	//TODO find a way to check result
+	list_free(list);
+	return true;
+}
+
+static bool batch_inserts_lots() {
+	srand(time(NULL));
+	int keys_n = 10000;
+	int result;
+	linked_list_t* list = list_alloc();
+	op_t params[keys_n];
+
+	for (int i = 0; i < keys_n; i++) {
+		params[i].compute_func = NULL;
+		params[i].data = &result;
+		params[i].key = rand();
+		params[i].op = INSERT;
+		params[i].result = -1;
+	}
+
+	list_batch(list, keys_n, params);
+	//TODO find a way to check result
+	list_free(list);
+	return true;
+}
+
+static bool batch_insert_remove() {
+	srand(3003);
+	int keys_n = 10000;
+	int result;
+	linked_list_t* list = list_alloc();
+	op_t params[keys_n];
+
+	for (int i = 0; i < keys_n; i+=2) {
+		params[i].compute_func = NULL;
+		params[i].data = &result;
+		params[i].key = rand();
+		params[i].op = INSERT;
+		params[i].result = -1;
+	}
+
+	for (int i = 1; i < keys_n; i+=2) {
+		params[i].compute_func = NULL;
+		params[i].data = &result;
+		params[i].key = rand();
+		params[i].op = REMOVE;
+		params[i].result = -1;
+	}
+
+	list_batch(list, keys_n, params);
+	//TODO find a way to check result
+	list_free(list);
+	return true;
+}
+
+
+
 int main(int argc, char** argv) {
 	RUN_TEST(alloc_and_free);
 	RUN_TEST(insert_empty_list);
@@ -278,6 +360,9 @@ int main(int argc, char** argv) {
 	RUN_TEST(update);
 	RUN_TEST(split);
 	RUN_TEST(batch_compute);
+	RUN_TEST(batch_inserts_few);
+	RUN_TEST(batch_inserts_lots);
+	RUN_TEST(batch_insert_remove);
 	return 0;
 }
 
