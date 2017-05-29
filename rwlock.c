@@ -15,6 +15,7 @@ void rw_lock_init(rwlock_t* lock) {
 	lock->number_of_readers = 0;
 	pthread_cond_init(&lock->readers_condition, NULL);
 	lock->number_of_writers = 0;
+	lock->writer_waiting = 0;
 	pthread_cond_init(&lock->writers_condition, NULL);
 	pthread_mutex_init(&lock->global_lock, NULL);
 }
@@ -27,13 +28,16 @@ void rw_lock_destroy(rwlock_t* lock) {
 }
 
 
-void read_lock(rwlock_t* lock) {
+int read_lock(rwlock_t* lock) {
 	assert(lock);
 	pthread_mutex_lock(&lock->global_lock);
-	while (lock->number_of_writers > 0)
-		pthread_cond_wait(&lock->readers_condition, &lock->global_lock);
+	while (lock->writer_waiting > 0 || lock->number_of_writers > 0){
+		pthread_mutex_unlock(&lock->global_lock);
+		return 0;
+	}
 	lock->number_of_readers++;
 	pthread_mutex_unlock(&lock->global_lock);
+	return 1;
 }
 
 void read_unlock(rwlock_t* lock) {
@@ -45,13 +49,19 @@ void read_unlock(rwlock_t* lock) {
 	pthread_mutex_unlock(&lock->global_lock);
 }
 
-void write_lock(rwlock_t* lock) {
+int write_lock(rwlock_t* lock) {
 	assert(lock);
 	pthread_mutex_lock(&lock->global_lock);
-	while ((lock->number_of_writers > 0) || (lock->number_of_readers > 0))
+	while (lock->writer_waiting > 0 || lock->number_of_writers > 0){
+		pthread_mutex_unlock(&lock->global_lock);
+		return 0;
+	}
+	lock->writer_waiting = 1;
+	while (lock->number_of_readers > 0)
 		pthread_cond_wait(&lock->writers_condition, &lock->global_lock);
 	lock->number_of_writers++;
 	pthread_mutex_unlock(&lock->global_lock);
+	return 1;
 }
 
 void write_unlock(rwlock_t* lock) {
