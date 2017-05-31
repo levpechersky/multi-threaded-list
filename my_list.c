@@ -147,7 +147,7 @@ static inline void init_node(node_t* new_node, int key, void* data) {
 	pthread_mutex_init(&new_node->lock, NULL);
 }
 
-//
+//node should be inaccessible for other threads and unlocked
 static inline void destroy_node(node_t* to_destroy) {
 	assert(to_destroy);
 	pthread_mutex_destroy(&to_destroy->lock);
@@ -191,7 +191,7 @@ static inline void remove_after(node_t* previous) {
 /* Return pointer to node v, where v.key < key. If for each node
  * node.key >= key (i.e. node with key should be 1st), returns NULL
  * (including the case when list is empty).
- * Returns locks it acquired, in output variables prev_lock and next_lock.
+ * Returns pointers to locks it acquired, in output variables prev_lock and next_lock.
  *
  * Uses hand-over-hand locking. Upon calling no node has to be locked.
  *
@@ -200,24 +200,26 @@ static inline void remove_after(node_t* previous) {
  * if returns NULL (only head is below key) - locks head and (if exists) the 1st node
  * otherwise locks closest below and next to it
  */
-static node_t* closest_below_key(linked_list_t* list, int key, mutex_t** prev_lock, mutex_t** next_lock) {
+static node_t* closest_below_key(linked_list_t* list, int key,
+		mutex_t** prev_lock, mutex_t** next_lock) {
 	assert(list && prev_lock && next_lock);
-	mutex_t *prev_lock = &list->head_ptr_lock, *next_lock = NULL;
+	*prev_lock = &list->head_ptr_lock;
+	*next_lock = NULL;
 
 	pthread_mutex_lock(&list->head_ptr_lock);
 	node_t *prev = NULL, *current = list->head;
 	if (list->head) {
 		pthread_mutex_lock(&list->head->lock);
-		next_lock = &list->head->lock;
+		*next_lock = &list->head->lock;
 	}
 	while (current && current->key < key) { //we enter here only if there's at least 1 node
-		pthread_mutex_unlock(prev_lock);
+		pthread_mutex_unlock(*prev_lock);
 		prev = current;
-		prev_lock = next_lock;
+		*prev_lock = *next_lock;
 		current = current->next;
 		if (current)
 			pthread_mutex_lock(&current->lock); //updated current, i.e. next node
-		next_lock = current ? &current->lock : NULL;
+		*next_lock = current ? &current->lock : NULL;
 	}
 	return prev;
 }
@@ -228,34 +230,20 @@ static node_t* closest_below_key(linked_list_t* list, int key, mutex_t** prev_lo
  */
 static node_t* find(linked_list_t* list, int key) {
 	assert(list);
-	node_t* res = NULL;
-	node_t* prev = closest_below_key(list, key); //returns with locks
-	if (prev && prev->next) { //both locked now
-		if (prev->next->key == key) {
-			res = prev->next;
-			pthread_mutex_unlock(&prev->lock);
-		} else {
-			node_t* tmp = prev->next;
-			pthread_mutex_unlock(&prev->lock);
-			pthread_mutex_unlock(&tmp->lock);
-		}
-	} else if (prev && !prev->next) {
-		// last node returned from closest_below_key
-		pthread_mutex_unlock(&prev->lock);
-	} else if (list->head) {
+	node_t* found = NULL;
+	mutex_t *prev_lock, *next_lock;
+
+	node_t* prev = closest_below_key(list, key, &prev_lock, &next_lock);
+	if (prev && prev->next && prev->next->key == key) { //both locked now
+		found = prev->next;
+	} else if (!prev && list->head && list->head->key == key) {
 		// prev == NULL, but there's at least 1 node in list, and then 1st node is locked too
-		if (list->head->key == key) {
-			res = list->head;
-			pthread_mutex_unlock(&list->head_ptr_lock);
-		} else {
-			node_t* tmp = list->head;
-			pthread_mutex_unlock(&list->head_ptr_lock);
-			pthread_mutex_unlock(&tmp->lock);
-		}
-	} else { // list empty
-		pthread_mutex_unlock(&list->head_ptr_lock);
+		found = list->head;
 	}
-	return res;
+	mutex_unlock_safe(prev_lock);
+	if (!found)
+		mutex_unlock_safe(next_lock);
+	return found;
 }
 
 static inline void list_init(linked_list_t* list) {
@@ -280,15 +268,28 @@ static void list_cleanup(linked_list_t* list) {
 	pthread_mutex_destroy(&list->head_ptr_lock);
 }
 
+static inline int alloc_and_init_list_array(int n, linked_list_t** arr) {
+	int i = 0;
+	for (; i < n; i++) {
+		arr[i] = list_alloc();
+		if (arr[i] == NULL)
+			goto cleanup;
+		list_init(arr[i]);
+	}
+	return SUCCESS;
+
+cleanup:
+	for (int j = 0; j < i; j++)
+		list_free(arr[j]);
+	return MEM_ERROR;
+}
+
 /*----------------------------Threaded functions wrapper----------------------*/
 
-//nothing seems to be critical here
 static void* run_op(void* list_and_params) {
-	//TODO remove this
 	assert(list_and_params);
 
 	list_params_t* params = (list_params_t*) list_and_params;
-
 	assert(params->list && params->op_param);
 
 	op_t* op = params->op_param;
@@ -329,13 +330,10 @@ linked_list_t* list_alloc() {
 void list_free(linked_list_t* list) {
 	if (!list)
 		return;
-
-	if (!cleanup_lock(&list->cleanup_lock)) {
+	if (!cleanup_lock(&list->cleanup_lock))
 		return;
-	}
-	//now no one can access the list
+
 	list_cleanup(list);
-	//TODO what if somebody enters here? Whatever
 	rc_lock_destroy(&list->cleanup_lock);
 	free(list);
 }
@@ -346,14 +344,15 @@ int list_split(linked_list_t* list, int n, linked_list_t** arr) {
 	if (n <= 0)
 		return INVALID_ARG;
 
+	if(alloc_and_init_list_array(n, arr) != SUCCESS)
+		return MEM_ERROR;
+	// TODO: for the assignment, we need to acquire lock as soon as possible,
+	// but, if new lists allocation fails, what do we do with lock?
+
 	if (!cleanup_lock(&list->cleanup_lock))
 		return CLEANUP_PENDING;
 
-	for (int i = 0; i < n; i++) {
-		arr[i] = list_alloc(); // TODO check
-		list_init(arr[i]);
-	}
-
+	//Now no one can access the list, so we bypass nodes locks
 	node_t* current = list->head;
 	int i = 0;
 	while (current) {
@@ -362,8 +361,6 @@ int list_split(linked_list_t* list, int n, linked_list_t** arr) {
 		current = current->next;
 	}
 	list_cleanup(list);
-
-	//TODO what if somebody enters here?
 	rc_lock_destroy(&list->cleanup_lock);
 	free(list);
 	return SUCCESS;
@@ -372,50 +369,38 @@ int list_split(linked_list_t* list, int n, linked_list_t** arr) {
 int list_insert(linked_list_t* list, int key, void* data) {
 	if (!list)
 		return NULL_ARG;
-
 	if (!read_lock(&list->cleanup_lock))
 		return CLEANUP_PENDING;
+	//Now no one can access the list, so we bypass nodes locks
 
 	int res = SUCCESS;
+	mutex_t *prev_lock, *next_lock;
 	node_t* new_node;
 	MALLOC_ORELSE(new_node, res=MEM_ERROR; goto unlock_rw);
 	init_node(new_node, key, data);
 
-	node_t* prev = closest_below_key(list, key);
-	if (!prev) { // head_lock and (if exists) 1st node are locked
-		node_t* first_in_list = list->head;
-		if (list->head && list->head->key == key) {
-			pthread_mutex_unlock(&list->head_ptr_lock);
-			pthread_mutex_unlock(&first_in_list->lock);
-			destroy_node(new_node);
-			res = ALREADY_IN_LIST;
-			goto unlock_rw;
-		}
+	node_t* prev = closest_below_key(list, key, &prev_lock, &next_lock);
+	if ((prev && prev->next && prev->next->key == key)
+			|| (!prev && list->head && list->head->key == key)) {
+		destroy_node(new_node);
+		res = ALREADY_IN_LIST;
+		goto unlock_prev_next;
+	}
+	if (!prev)  // head_lock and (if exists) 1st node are locked
 		insert_first(list, new_node);
-		pthread_mutex_unlock(&list->head_ptr_lock);
-		if (first_in_list)
-			pthread_mutex_unlock(&first_in_list->lock);
-	}
-	else { // prev and prev->next (if exists) are locked
-		node_t* tmp = prev->next;
-		if (prev->next && prev->next->key == key) {
-			pthread_mutex_unlock(&prev->lock);
-			pthread_mutex_unlock(&tmp->lock);
-			destroy_node(new_node);
-			res = ALREADY_IN_LIST;
-			goto unlock_rw;
-		}
+	else		// prev and prev->next (if exists) are locked
 		insert_after(prev, new_node);
-		pthread_mutex_unlock(&prev->lock);
-		if (tmp)
-			pthread_mutex_unlock(&tmp->lock);
+
+unlock_prev_next:
+	mutex_unlock_safe(prev_lock);
+	mutex_unlock_safe(next_lock);
+	if (res == SUCCESS) {
+		pthread_mutex_lock(&list->size_lock);
+		list->size++;
+		pthread_mutex_unlock(&list->size_lock);
 	}
 
-	pthread_mutex_lock(&list->size_lock);
-	list->size++;
-	pthread_mutex_unlock(&list->size_lock);
-
-	unlock_rw:
+unlock_rw:
 	read_unlock(&list->cleanup_lock);
 	return res;
 }
@@ -423,55 +408,32 @@ int list_insert(linked_list_t* list, int key, void* data) {
 int list_remove(linked_list_t* list, int key) {
 	if (!list)
 		return NULL_ARG;
-
 	if (!read_lock(&list->cleanup_lock))
 		return CLEANUP_PENDING;
 
 	int res = SUCCESS;
-
-	node_t* prev = closest_below_key(list, key); //returns with locks
-
-	if (prev && prev->next) { //both locked now
-		node_t* tmp = prev->next;
-		if (prev->next->key == key) {
-			remove_after(prev);
-			pthread_mutex_unlock(&prev->lock);
-			//no unlock for prev->next (which has been removed)
-		} else {
-			pthread_mutex_unlock(&prev->lock);
-			pthread_mutex_unlock(&tmp->lock);
-			res = NOT_FOUND;
-			goto rw_unlock;
-		}
-	} else if (prev && !prev->next) {
-		// last node returned from closest_below_key
-		pthread_mutex_unlock(&prev->lock);
+	mutex_t *prev_lock, *next_lock;
+	node_t* prev = closest_below_key(list, key, &prev_lock, &next_lock);
+	if ((prev && !prev->next) || (prev && prev->next && prev->next->key != key)
+			|| (!prev && !list->head)
+			|| (!prev && list->head && list->head->key != key)) {
 		res = NOT_FOUND;
-		goto rw_unlock;
-	} else if (list->head) {
-		// prev == NULL, but there's at least 1 node in list, and then 1st node is locked too
-		node_t* tmp = list->head;
-		if (list->head->key == key) {
-			remove_first(list);
-			pthread_mutex_unlock(&list->head_ptr_lock);
-			//no unlock for tmp (which has been removed)
-		} else {
-			pthread_mutex_unlock(&list->head_ptr_lock);
-			pthread_mutex_unlock(&tmp->lock);
-			res = NOT_FOUND;
-			goto rw_unlock;
-		}
-	} else { // list empty
-		pthread_mutex_unlock(&list->head_ptr_lock);
-		res = NOT_FOUND;
-		goto rw_unlock;
+		goto unlock_prev_next;
 	}
+	if (!prev)  // head_lock and 1st node are locked
+		remove_first(list);
+	else 	   // prev and prev->next are locked
+		remove_after(prev);
 
-	pthread_mutex_lock(&list->size_lock);
-	list->size--;
-	pthread_mutex_unlock(&list->size_lock);
-
-	rw_unlock:
+unlock_prev_next:
+	mutex_unlock_safe(prev_lock);
+	if (res != SUCCESS) {
+		mutex_unlock_safe(next_lock); // if successfully deleted - this lock doesn't exist anymore
+	} else {
+		pthread_mutex_lock(&list->size_lock);
+		list->size--;
+		pthread_mutex_unlock(&list->size_lock);
+	}
 	read_unlock(&list->cleanup_lock);
 	return res;
 }
@@ -479,7 +441,6 @@ int list_remove(linked_list_t* list, int key) {
 int list_find(linked_list_t* list, int key) {
 	if (!list)
 		return NULL_ARG;
-
 	if (!read_lock(&list->cleanup_lock))
 		return CLEANUP_PENDING;
 
@@ -510,7 +471,6 @@ int list_size(linked_list_t* list) {
 int list_update(linked_list_t* list, int key, void* data) {
 	if (!list)
 		return NULL_ARG;
-
 	if (!read_lock(&list->cleanup_lock))
 		return CLEANUP_PENDING;
 
@@ -520,11 +480,10 @@ int list_update(linked_list_t* list, int key, void* data) {
 		res = NOT_FOUND;
 		goto unlock_rw;
 	}
-
 	to_update->data = data;
 	pthread_mutex_unlock(&to_update->lock);
 
-	unlock_rw:
+unlock_rw:
 	read_unlock(&list->cleanup_lock);
 	return res;
 }
@@ -533,7 +492,6 @@ int list_compute(linked_list_t* list, int key,
 		int (*compute_func)(void *), int* result) {
 	if (!list || !result || !compute_func)
 		return NULL_ARG;
-
 	if (!read_lock(&list->cleanup_lock))
 		return CLEANUP_PENDING;
 
@@ -543,11 +501,10 @@ int list_compute(linked_list_t* list, int key,
 		res = NOT_FOUND;
 		goto unlock_rw;
 	}
-
 	*result = compute_func(to_compute->data);
 	pthread_mutex_unlock(&to_compute->lock);
 
-	unlock_rw:
+unlock_rw:
 	read_unlock(&list->cleanup_lock);
 	return res;
 }
@@ -566,12 +523,7 @@ void list_batch(linked_list_t* list, int num_ops, op_t* ops) {
 		pthread_create(&threads[i], NULL, run_op, &params[i]); //TODO do something in case of failure
 	}
 	for (int i = 0; i < num_ops; i++) {
-#ifdef NDEBUG
-		pthread_join(threads[i], NULL);
-#else
-		int r = pthread_join(threads[i], NULL);
-		assert(r == 0);
-#endif
+		pthread_join(threads[i], NULL); // TODO should I check exit status?
 	}
 	free(params);
 	free(threads);
