@@ -296,6 +296,7 @@ static void* run_op(void* list_and_params) {
 	op_t* op = params->op_param;
 	linked_list_t* list = params->list;
 
+	int val;
 	switch (op->op) {
 	case INSERT:
 		op->result = list_insert(list, op->key, op->data);
@@ -310,7 +311,8 @@ static void* run_op(void* list_and_params) {
 		op->result = list_update(list, op->key, op->data);
 		break;
 	case COMPUTE:
-		op->result = list_compute(list, op->key, op->compute_func, op->data);
+		op->result = list_compute(list, op->key, op->compute_func, &val);
+		op->data = (void*)(long long)val;
 		break;
 	default:
 		assert(0);
